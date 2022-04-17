@@ -4,8 +4,10 @@ namespace PHPStan\Reflection\SignatureMap;
 
 use PhpParser\Node\Expr\Variable;
 use PhpParser\Node\FunctionLike;
+use PhpParser\Node\Scalar\String_;
 use PhpParser\Node\Stmt\ClassMethod;
 use PhpParser\Node\Stmt\Function_;
+use PHPStan\Php\PhpVersion;
 use PHPStan\Php8StubsMap;
 use PHPStan\PhpDoc\Tag\ParamTag;
 use PHPStan\Reflection\BetterReflection\SourceLocator\FileNodesFetcher;
@@ -20,6 +22,7 @@ use ReflectionMethod;
 use function array_key_exists;
 use function array_map;
 use function count;
+use function explode;
 use function is_string;
 use function sprintf;
 use function strtolower;
@@ -36,6 +39,7 @@ class Php8SignatureMapProvider implements SignatureMapProvider
 		private FunctionSignatureMapProvider $functionSignatureMapProvider,
 		private FileNodesFetcher $fileNodesFetcher,
 		private FileTypeMapper $fileTypeMapper,
+		private PhpVersion $phpVersion,
 	)
 	{
 	}
@@ -88,11 +92,48 @@ class Php8SignatureMapProvider implements SignatureMapProvider
 			}
 
 			if ($stmt->name->toLowerString() === $lowerMethodName) {
+				if (!$this->isForCurrentVersion($stmt)) {
+					continue;
+				}
 				return $this->methodNodes[$lowerClassName][$lowerMethodName] = [$stmt, $stubFile];
 			}
 		}
 
 		return null;
+	}
+
+	private function isForCurrentVersion(FunctionLike $functionLike): bool
+	{
+		foreach ($functionLike->getAttrGroups() as $attrGroup) {
+			foreach ($attrGroup->attrs as $attr) {
+				if ($attr->name->toString() === 'Until') {
+					$arg = $attr->args[0]->value;
+					if (!$arg instanceof String_) {
+						throw new ShouldNotHappenException();
+					}
+					$parts = explode('.', $arg->value);
+					$versionId = (int) $parts[0] * 10000 + (int) ($parts[1] ?? 0) * 100 + (int) ($parts[2] ?? 0);
+					if ($this->phpVersion->getVersionId() >= $versionId) {
+						return false;
+					}
+				}
+				if ($attr->name->toString() !== 'Since') {
+					continue;
+				}
+
+				$arg = $attr->args[0]->value;
+				if (!$arg instanceof String_) {
+					throw new ShouldNotHappenException();
+				}
+				$parts = explode('.', $arg->value);
+				$versionId = (int) $parts[0] * 10000 + (int) ($parts[1] ?? 0) * 100 + (int) ($parts[2] ?? 0);
+				if ($this->phpVersion->getVersionId() < $versionId) {
+					return false;
+				}
+			}
+		}
+
+		return true;
 	}
 
 	public function hasFunctionSignature(string $name, int $variant = 0): bool
@@ -160,19 +201,26 @@ class Php8SignatureMapProvider implements SignatureMapProvider
 		$stubFile = self::DIRECTORY . '/' . Php8StubsMap::FUNCTIONS[$lowerName];
 		$nodes = $this->fileNodesFetcher->fetchNodes($stubFile);
 		$functions = $nodes->getFunctionNodes();
-		if (count($functions[$lowerName]) !== 1) {
+		if (!array_key_exists($lowerName, $functions)) {
 			throw new ShouldNotHappenException(sprintf('Function %s stub not found in %s.', $functionName, $stubFile));
 		}
+		foreach ($functions[$lowerName] as $functionNode) {
+			if (!$this->isForCurrentVersion($functionNode->getNode())) {
+				continue;
+			}
 
-		$signature = $this->getSignature($functions[$lowerName][0]->getNode(), null, $stubFile);
-		if ($this->functionSignatureMapProvider->hasFunctionSignature($functionName)) {
-			return $this->mergeSignatures(
-				$signature,
-				$this->functionSignatureMapProvider->getFunctionSignature($functionName, $className),
-			);
+			$signature = $this->getSignature($functionNode->getNode(), null, $stubFile);
+			if ($this->functionSignatureMapProvider->hasFunctionSignature($functionName)) {
+				return $this->mergeSignatures(
+					$signature,
+					$this->functionSignatureMapProvider->getFunctionSignature($functionName, $className),
+				);
+			}
+
+			return $signature;
 		}
 
-		return $signature;
+		throw new ShouldNotHappenException(sprintf('Function %s stub not found in %s.', $functionName, $stubFile));
 	}
 
 	private function mergeSignatures(FunctionSignature $nativeSignature, FunctionSignature $functionMapSignature): FunctionSignature
